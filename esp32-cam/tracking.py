@@ -11,6 +11,11 @@ import os
 from datetime import datetime
 from ultralytics import YOLO
 
+try:
+    import pyodbc
+except ImportError:
+    pyodbc = None
+
 
 # =========================================================
 # CAMERA CONFIG
@@ -140,6 +145,24 @@ RECORDING_CODEC = "mp4v"
 
 os.makedirs(RECORDING_DIR, exist_ok=True)
 
+# =========================================================
+# SQL SERVER CONFIG - WINDOWS AUTHENTICATION
+# =========================================================
+
+# Theo lich su ket noi trong anh SSMS, thu dung server (local) truoc.
+# Neu SSMS ket noi bang ten khac, sua SQLSERVER_SERVER cho trung khop.
+# Vi du: r"DESKTOP-B3BC4EU\SQLEXPRESS" hoac r"localhost".
+# Tu dong chon ODBC Driver 18 hoac 17 da cai tren Windows.
+SQLSERVER_SERVER = r"(local)"
+SQLSERVER_ENCRYPT = "yes"
+SQLSERVER_TRUST_CERTIFICATE = "yes"
+DB_NAME = "esp32_surveillance"
+DB_SCHEMA = "dbo"
+DB_TABLE = "person_events"
+
+# Chi luu metadata sau khi clip MP4 da dong; DB chay trong luong rieng.
+db_event_queue = queue.Queue(maxsize=200)
+
 # Hang doi rieng, gioi han de khong tich luy RAM; luong camera/display khong cho ghi file.
 # Khi day, bo frame cu thay vi block live view.
 record_queue = queue.Queue(maxsize=30)
@@ -160,77 +183,311 @@ frame_queue = queue.Queue(maxsize=1)
 running = True
 
 
-def recording_thread():
-    """Ghi frame co nguoi va ghi tiep toi da 3 giay canh trong sau lan cuoi.
+def create_sqlserver_connection():
+    """Ket noi SQL Server bang Windows Authentication; tao database/bang neu du quyen."""
+    if pyodbc is None:
+        raise RuntimeError(
+            "Chua cai pyodbc. Chay: python -m pip install pyodbc"
+        )
 
-    Moi hang doi gom (frame goc, timestamp monotonic, YOLO co phat hien nguoi).
-    Frame trong chi duoc ghi neu clip da mo; no khong the tu mo mot clip moi.
-    """
+    # Tu chon ODBC Driver da cai tren Windows.
+    installed_drivers = pyodbc.drivers()
+    sql_driver = next(
+        (name for name in ("ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server")
+         if name in installed_drivers),
+        None,
+    )
+    if sql_driver is None:
+        raise RuntimeError(
+            "Khong tim thay Microsoft ODBC Driver 18/17 for SQL Server. "
+            f"Driver dang co: {installed_drivers}. Hay cai Microsoft ODBC Driver for SQL Server."
+        )
+
+    # Ket noi vao master de tao database neu chua ton tai.
+    master_conn_str = (
+        f"DRIVER={{{sql_driver}}};"
+        f"SERVER={SQLSERVER_SERVER};"
+        "DATABASE=master;"
+        "Trusted_Connection=yes;"
+        f"Encrypt={SQLSERVER_ENCRYPT};"
+        f"TrustServerCertificate={SQLSERVER_TRUST_CERTIFICATE};"
+        "Connection Timeout=3;"
+    )
+    master_conn = pyodbc.connect(master_conn_str, timeout=3, autocommit=True)
+    try:
+        cursor = master_conn.cursor()
+        cursor.execute("SELECT DB_ID(?)", DB_NAME)
+        database_exists = cursor.fetchone()[0] is not None
+        if not database_exists:
+            # DB_NAME la hang so duoc cau hinh trong file, dong ngoac de tranh loi ten.
+            safe_db_name = DB_NAME.replace("]", "]]" )
+            cursor.execute(f"CREATE DATABASE [{safe_db_name}]")
+            print(f"[DB] Da tao database {DB_NAME}", flush=True)
+        cursor.close()
+    finally:
+        master_conn.close()
+
+    db_conn_str = (
+        f"DRIVER={{{sql_driver}}};"
+        f"SERVER={SQLSERVER_SERVER};"
+        f"DATABASE={DB_NAME};"
+        "Trusted_Connection=yes;"
+        f"Encrypt={SQLSERVER_ENCRYPT};"
+        f"TrustServerCertificate={SQLSERVER_TRUST_CERTIFICATE};"
+        "Connection Timeout=3;"
+    )
+    conn = pyodbc.connect(db_conn_str, timeout=3, autocommit=False)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        IF OBJECT_ID(N'{DB_SCHEMA}.{DB_TABLE}', N'U') IS NULL
+        BEGIN
+            CREATE TABLE [{DB_SCHEMA}].[{DB_TABLE}] (
+                id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                event_start DATETIME2(3) NOT NULL,
+                last_detected_at DATETIME2(3) NOT NULL,
+                clip_saved_at DATETIME2(3) NOT NULL,
+                video_filename NVARCHAR(255) NOT NULL,
+                video_path NVARCHAR(1024) NOT NULL,
+                video_duration_seconds DECIMAL(10,2) NOT NULL CONSTRAINT DF_person_events_duration DEFAULT 0,
+                total_frames INT NOT NULL CONSTRAINT DF_person_events_total_frames DEFAULT 0,
+                detected_frames INT NOT NULL CONSTRAINT DF_person_events_detected_frames DEFAULT 0,
+                created_at DATETIME2(3) NOT NULL CONSTRAINT DF_person_events_created_at DEFAULT SYSDATETIME()
+            );
+            CREATE INDEX IX_person_events_event_start
+                ON [{DB_SCHEMA}].[{DB_TABLE}](event_start);
+        END
+        """
+    )
+    conn.commit()
+    cursor.close()
+    return conn
+
+
+def database_thread():
+    """Luu su kien vao SQL Server o luong rieng, khong block camera/YOLO."""
+    if pyodbc is None:
+        print(
+            "[DB] THIEU THU VIEN pyodbc. Cai bang: python -m pip install pyodbc",
+            flush=True,
+        )
+        while running:
+            time.sleep(0.5)
+        return
+
+    conn = None
+    pending_event = None
+    next_connect_attempt = 0.0
+    last_error_print = 0.0
+    shutdown_failures = 0
+
+    while running or pending_event is not None or not db_event_queue.empty():
+        if pending_event is None:
+            try:
+                pending_event = db_event_queue.get(timeout=0.5)
+                shutdown_failures = 0
+            except queue.Empty:
+                pending_event = None
+
+        now = time.monotonic()
+        if conn is None and now >= next_connect_attempt:
+            try:
+                conn = create_sqlserver_connection()
+                print(
+                    f"[DB] Da ket noi SQL Server: {SQLSERVER_SERVER}/{DB_NAME}.{DB_SCHEMA}.{DB_TABLE}",
+                    flush=True,
+                )
+                last_error_print = 0.0
+            except Exception as exc:
+                if now - last_error_print >= 15.0:
+                    print(
+                        f"[DB] Chua ket noi duoc SQL Server: {exc}. Se thu lai; camera van tiep tuc.",
+                        flush=True,
+                    )
+                    print(
+                        "[DB] Kiem tra ten Server trong SSMS, ODBC Driver va quyen tao database.",
+                        flush=True,
+                    )
+                    last_error_print = now
+                next_connect_attempt = now + 5.0
+                if pending_event is not None and not running:
+                    shutdown_failures += 1
+                    if shutdown_failures >= 3:
+                        print(
+                            "[DB] Khong luu duoc su kien do SQL Server khong kha dung khi thoat chuong trinh.",
+                            flush=True,
+                        )
+                        db_event_queue.task_done()
+                        pending_event = None
+                time.sleep(0.1)
+                continue
+
+        if pending_event is None:
+            continue
+
+        if conn is None:
+            time.sleep(0.1)
+            continue
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                INSERT INTO [{DB_SCHEMA}].[{DB_TABLE}]
+                    (event_start, last_detected_at, clip_saved_at,
+                     video_filename, video_path, video_duration_seconds,
+                     total_frames, detected_frames)
+                OUTPUT INSERTED.id
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                pending_event["event_start"],
+                pending_event["last_detected_at"],
+                pending_event["clip_saved_at"],
+                pending_event["video_filename"],
+                pending_event["video_path"],
+                pending_event["video_duration_seconds"],
+                pending_event["total_frames"],
+                pending_event["detected_frames"],
+            )
+            result = cursor.fetchone()
+            conn.commit()
+            event_id = result[0] if result else "?"
+            cursor.close()
+            print(
+                f"[DB] Da luu su kien #{event_id}: {pending_event['video_filename']}",
+                flush=True,
+            )
+            db_event_queue.task_done()
+            pending_event = None
+            shutdown_failures = 0
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
+            next_connect_attempt = time.monotonic() + 3.0
+            if time.monotonic() - last_error_print >= 15.0:
+                print(f"[DB] Loi ghi SQL Server: {exc}. Se thu lai.", flush=True)
+                last_error_print = time.monotonic()
+            if not running:
+                shutdown_failures += 1
+                if shutdown_failures >= 3:
+                    print(
+                        "[DB] Bo qua ban ghi dang cho do khong the ket noi SQL Server khi thoat.",
+                        flush=True,
+                    )
+                    db_event_queue.task_done()
+                    pending_event = None
+            time.sleep(0.1)
+
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def recording_thread():
+    """Ghi clip co nguoi + 3 giay canh trong; day metadata vao hang doi SQL Server khi dong clip."""
     writer = None
     current_path = None
     last_detection_time = None
+    event_start_wall = None
+    last_detected_wall = None
+    total_frames = 0
+    detected_frames = 0
 
     def close_writer():
         nonlocal writer, current_path, last_detection_time
+        nonlocal event_start_wall, last_detected_wall, total_frames, detected_frames
         if writer is not None:
             writer.release()
-            print("[REC] Da luu video:", current_path, flush=True)
+            saved_at = datetime.now()
+            if current_path and os.path.isfile(current_path) and os.path.getsize(current_path) > 0:
+                clip_duration = total_frames / RECORDING_FPS if RECORDING_FPS > 0 else 0.0
+                event_data = {
+                    "event_start": event_start_wall,
+                    "last_detected_at": last_detected_wall or event_start_wall,
+                    "clip_saved_at": saved_at,
+                    "video_filename": os.path.basename(current_path),
+                    "video_path": os.path.abspath(current_path),
+                    "video_duration_seconds": round(clip_duration, 2),
+                    "total_frames": total_frames,
+                    "detected_frames": detected_frames,
+                }
+                try:
+                    db_event_queue.put_nowait(event_data)
+                    print("[REC] Da luu video:", current_path, flush=True)
+                except queue.Full:
+                    print("[DB] Hang doi CSDL day, khong the xep su kien:", current_path, flush=True)
+            else:
+                print("[REC] File video khong ton tai hoac rong, bo qua:", current_path, flush=True)
         writer = None
         current_path = None
         last_detection_time = None
+        event_start_wall = None
+        last_detected_wall = None
+        total_frames = 0
+        detected_frames = 0
 
-    def open_writer(frame):
-        nonlocal writer, current_path
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    def open_writer(frame, wall_time):
+        nonlocal writer, current_path, event_start_wall, last_detected_wall
+        nonlocal total_frames, detected_frames
+        stamp = wall_time.strftime("%Y%m%d_%H%M%S_%f")
         current_path = os.path.join(RECORDING_DIR, f"person_{stamp}.mp4")
         height, width = frame.shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*RECORDING_CODEC)
-        writer = cv2.VideoWriter(
-            current_path, fourcc, RECORDING_FPS, (width, height)
-        )
+        writer = cv2.VideoWriter(current_path, fourcc, RECORDING_FPS, (width, height))
         if not writer.isOpened():
             print("[REC] Khong mo duoc file video:", current_path, flush=True)
             writer.release()
             writer = None
             current_path = None
             return False
+        event_start_wall = wall_time
+        last_detected_wall = wall_time
+        total_frames = 0
+        detected_frames = 0
         print("[REC] Bat dau ghi:", current_path, flush=True)
         return True
 
     while running or not record_queue.empty():
         try:
-            frame, captured_at, person_detected = record_queue.get(timeout=0.1)
+            frame, captured_at, person_detected, wall_time = record_queue.get(timeout=0.1)
         except queue.Empty:
-            # Khi het cua so 3 giay tinh tu frame co nguoi cuoi cung, dong file.
             if (writer is not None and last_detection_time is not None
                     and time.monotonic() - last_detection_time >= RECORDING_STOP_DELAY):
                 close_writer()
             continue
 
         try:
-            # Neu nguoi quay lai sau >= 3 giay vang, dong clip cu truoc.
-            # Frame co nguoi se mo clip moi; frame trong sau han bi bo qua.
             if (writer is not None and last_detection_time is not None
                     and captured_at - last_detection_time >= RECORDING_STOP_DELAY):
                 close_writer()
 
-            # Khong mo file neu frame nay khong co nguoi va chua co clip.
             if writer is None:
                 if not person_detected:
                     continue
-                if not open_writer(frame):
+                if not open_writer(frame, wall_time):
                     continue
 
-            # Moc thoi gian chi duoc lam moi khi YOLO dang bao co nguoi.
             if person_detected:
                 last_detection_time = captured_at
+                last_detected_wall = wall_time
+                detected_frames += 1
             elif (last_detection_time is None
                   or captured_at - last_detection_time >= RECORDING_STOP_DELAY):
                 close_writer()
                 continue
 
-            # Ghi frame camera goc, khong co box/chu/crosshair.
+            # Chi ghi frame goc; khong co box YOLO hay chu trang thai.
             writer.write(frame)
+            total_frames += 1
         except Exception as exc:
             print("[REC] Loi ghi video:", exc, flush=True)
             close_writer()
@@ -449,6 +706,12 @@ camera_thread_obj = threading.Thread(
 )
 
 camera_thread_obj.start()
+
+database_thread_obj = threading.Thread(
+    target=database_thread,
+    daemon=True
+)
+database_thread_obj.start()
 
 recording_thread_obj = threading.Thread(
     target=recording_thread,
@@ -693,6 +956,7 @@ print(f"YOLO interval: {YOLO_INTERVAL}s")
 print(f"YOLO confidence: {CONFIDENCE}")
 print(f"Recording folder: {RECORDING_DIR}")
 print(f"Recording: person detected + {RECORDING_STOP_DELAY}s final empty scene.")
+print(f"SQL Server: {SQLSERVER_SERVER}/{DB_NAME}.{DB_SCHEMA}.{DB_TABLE}")
 print("Return HOME: 10 seconds")
 print("HOME PAN : 90")
 print("HOME TILT: 90")
@@ -1018,7 +1282,7 @@ while running:
     if within_recording_window and (
         captured_at - last_recording_frame_time >= 1.0 / RECORDING_FPS
     ):
-        record_item = (frame.copy(), captured_at, bool(person_detected_now))
+        record_item = (frame.copy(), captured_at, bool(person_detected_now), datetime.now())
 
         if record_queue.full():
             try:
@@ -1204,6 +1468,11 @@ except Exception:
 # Cho writer ket thuc dong file MP4 truoc khi thoat.
 recording_thread_obj.join()
 
+# Cho DB luu su kien vua dong clip; khong doi vo han neu SQL Server dang loi.
+try:
+    database_thread_obj.join(timeout=5.0)
+except Exception:
+    pass
 
 try:
 
