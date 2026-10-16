@@ -12,7 +12,7 @@ from ultralytics import YOLO
 # CAMERA CONFIG
 # =========================================================
 
-ESP32_CAM_IP = "192.168.1.8"
+ESP32_CAM_IP = "192.168.1.11"
 
 STREAM_URL = f"http://{ESP32_CAM_IP}/stream"
 
@@ -37,9 +37,12 @@ YOLO_INTERVAL = 0.14
 PERSON_CLASS = 0
 
 # Confidence tối thiểu
-CONFIDENCE = 0.50
+CONFIDENCE = 0.35
 
+YOLO_IMGSZ = 800
 
+# NMS: loai bo cac bounding box trung lap
+YOLO_IOU = 0.50
 # =========================================================
 # SERVO LIMIT
 # =========================================================
@@ -611,70 +614,46 @@ while running:
     # YOLO
     # =====================================================
 
-    if (
-        current_time - last_yolo_time
-        >= YOLO_INTERVAL
-    ):
+    
+    # =====================================================
+    # YOLO
+    # =====================================================
 
+    if current_time - last_yolo_time >= YOLO_INTERVAL:
         last_yolo_time = current_time
 
-
-        # -------------------------------------------------
         # YOLO DETECTION
-        # -------------------------------------------------
-
-        results = model(
-            frame,
-            verbose=False,
+        results = model.predict(
+            source=frame,
+            imgsz=YOLO_IMGSZ,
+            conf=CONFIDENCE,
+            iou=YOLO_IOU,
             classes=[PERSON_CLASS],
-            conf=CONFIDENCE
+            verbose=False
         )
-
 
         persons = []
 
-
-        # -------------------------------------------------
         # READ DETECTIONS
-        # -------------------------------------------------
-
         for result in results:
-
             if result.boxes is None:
-
                 continue
 
-
             for box in result.boxes:
-
                 x1, y1, x2, y2 = map(
-                    int,
-                    box.xyxy[0]
+                    int, box.xyxy[0].tolist()
                 )
 
-
-                confidence = float(
-                    box.conf[0]
-                )
-
+                confidence = float(box.conf[0])
 
                 width = x2 - x1
                 height = y2 - y1
-
-
                 area = width * height
 
+                persons.append((
+                    area, x1, y1, x2, y2, confidence
+                ))
 
-                persons.append(
-                    (
-                        area,
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        confidence
-                    )
-                )
 
 
         # =================================================
