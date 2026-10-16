@@ -9,6 +9,7 @@ import threading
 import queue
 import os
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ultralytics import YOLO
 
 try:
@@ -24,6 +25,17 @@ except ImportError:
 ESP32_CAM_IP = "192.168.1.38"
 
 STREAM_URL = f"http://{ESP32_CAM_IP}/stream"
+
+# Luong MJPEG noi bo do tracking.py chia se cho Flask dashboard.
+# Dashboard se doc tu localhost nay thay vi mo them ket noi den ESP32-CAM.
+TRACKING_RELAY_HOST = "127.0.0.1"
+TRACKING_RELAY_PORT = 8765
+
+# Giu nguyen JPEG goc nhan tu ESP32-CAM, khong encode lai va khong tao them tai CPU.
+latest_jpeg = None
+latest_jpeg_version = 0
+latest_jpeg_condition = threading.Condition()
+tracking_relay_server = None
 
 
 # =========================================================
@@ -181,6 +193,104 @@ frame_queue = queue.Queue(maxsize=1)
 
 
 running = True
+
+
+class TrackingMjpegHandler(BaseHTTPRequestHandler):
+    """Serve the most recent original JPEG frame without reconnecting to ESP32-CAM."""
+
+    protocol_version = "HTTP/1.0"
+
+    def do_GET(self):
+        if self.path not in ("/", "/stream"):
+            self.send_error(404, "Use /stream")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        seen_version = 0
+        try:
+            while running:
+                with latest_jpeg_condition:
+                    latest_jpeg_condition.wait_for(
+                        lambda: latest_jpeg_version > seen_version or not running,
+                        timeout=3.0,
+                    )
+                    jpeg = latest_jpeg
+                    version = latest_jpeg_version
+
+                if not running:
+                    break
+                if jpeg is None or version <= seen_version:
+                    continue
+
+                # Forward raw JPEG bytes. No frame re-encoding and no extra ESP32 connection.
+                header = (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+                )
+                self.wfile.write(header)
+                self.wfile.write(jpeg)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                seen_version = version
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            # Browser closed the live-view tab/button; tracking must continue unaffected.
+            pass
+
+    def log_message(self, format_string, *args):
+        # Avoid one console log line per browser request/frame.
+        return
+
+
+def start_tracking_relay_server():
+    """Start a local MJPEG relay which reuses frames already received by tracking.py."""
+    global tracking_relay_server
+    try:
+        tracking_relay_server = ThreadingHTTPServer(
+            (TRACKING_RELAY_HOST, TRACKING_RELAY_PORT),
+            TrackingMjpegHandler,
+        )
+        tracking_relay_server.daemon_threads = True
+        relay_thread = threading.Thread(
+            target=tracking_relay_server.serve_forever,
+            name="tracking-mjpeg-relay",
+            daemon=True,
+        )
+        relay_thread.start()
+        print(
+            f"[WEB] Luong chia se san sang: http://{TRACKING_RELAY_HOST}:{TRACKING_RELAY_PORT}/stream",
+            flush=True,
+        )
+        print(
+            "[WEB] Dashboard se dung chung frame voi tracking.py, khong mo ket noi ESP32-CAM thu hai.",
+            flush=True,
+        )
+    except OSError as exc:
+        tracking_relay_server = None
+        print(
+            f"[WEB] KHONG MO DUOC cong relay {TRACKING_RELAY_PORT}: {exc}. "
+            "Dashboard se khong xem duoc live view cho den khi cong duoc giai phong.",
+            flush=True,
+        )
+
+
+def stop_tracking_relay_server():
+    global tracking_relay_server
+    with latest_jpeg_condition:
+        latest_jpeg_condition.notify_all()
+    if tracking_relay_server is not None:
+        try:
+            tracking_relay_server.shutdown()
+            tracking_relay_server.server_close()
+        except Exception:
+            pass
+        tracking_relay_server = None
 
 
 def create_sqlserver_connection():
@@ -653,6 +763,15 @@ def camera_thread():
                 continue
 
 
+            # Chia se JPEG goc cho dashboard qua relay localhost.
+            # Khong mo them URL /stream tren ESP32-CAM, khong encode lai frame.
+            global latest_jpeg, latest_jpeg_version
+            with latest_jpeg_condition:
+                latest_jpeg = jpg
+                latest_jpeg_version += 1
+                latest_jpeg_condition.notify_all()
+
+
             # =================================================
             # LATEST FRAME ONLY
             # =================================================
@@ -697,8 +816,11 @@ def camera_thread():
 
 
 # =========================================================
-# START CAMERA THREAD
+# START LOCAL WEB RELAY AND CAMERA THREAD
 # =========================================================
+
+# Flask dashboard connects to this local relay. Only camera_thread connects to ESP32-CAM.
+start_tracking_relay_server()
 
 camera_thread_obj = threading.Thread(
     target=camera_thread,
@@ -951,6 +1073,7 @@ print("========================================")
 print("ESP32-CAM PERSON TRACKING")
 print("========================================")
 print(f"Camera: {ESP32_CAM_IP}")
+print(f"Dashboard relay: http://{TRACKING_RELAY_HOST}:{TRACKING_RELAY_PORT}/stream")
 print(f"Serial: {SERIAL_PORT}")
 print(f"YOLO interval: {YOLO_INTERVAL}s")
 print(f"YOLO confidence: {CONFIDENCE}")
@@ -1458,8 +1581,13 @@ while running:
 # CLEANUP
 # =========================================================
 
-# Cho luong ghi xu ly het frame dang cho roi dong file MP4.
+# Dong luong share frame cho dashboard; khong anh huong cac file MP4 da luu.
 running = False
+with latest_jpeg_condition:
+    latest_jpeg_condition.notify_all()
+stop_tracking_relay_server()
+
+# Cho luong ghi xu ly het frame dang cho roi dong file MP4.
 try:
     recording_thread_obj.join(timeout=5.0)
 except Exception:
