@@ -1,3 +1,5 @@
+print("[START] tracking.py dang khoi dong", flush=True)
+
 import cv2
 import urllib.request
 import numpy as np
@@ -5,6 +7,8 @@ import serial
 import time
 import threading
 import queue
+import os
+from datetime import datetime
 from ultralytics import YOLO
 
 
@@ -12,7 +16,7 @@ from ultralytics import YOLO
 # CAMERA CONFIG
 # =========================================================
 
-ESP32_CAM_IP = "192.168.1.11"
+ESP32_CAM_IP = "192.168.1.38"
 
 STREAM_URL = f"http://{ESP32_CAM_IP}/stream"
 
@@ -36,13 +40,11 @@ YOLO_INTERVAL = 0.14
 # COCO class 0 = person
 PERSON_CLASS = 0
 
-# Confidence tối thiểu
+# Ha nguong confidence de tang kha nang phat hien nguoi; khong tang kich thuoc anh de giu toc do
 CONFIDENCE = 0.35
+YOLO_IMGSZ = 640
 
-YOLO_IMGSZ = 800
 
-# NMS: loai bo cac bounding box trung lap
-YOLO_IOU = 0.50
 # =========================================================
 # SERVO LIMIT
 # =========================================================
@@ -127,6 +129,22 @@ DETECTION_DISPLAY_TIMEOUT = 0.5
 
 
 # =========================================================
+# EVENT RECORDING (BACKGROUND THREAD)
+# =========================================================
+
+# Khi khong con thay nguoi, ghi them 3 giay canh trong roi dong clip.
+RECORDING_STOP_DELAY = 3.0
+RECORDING_DIR = r"D:\esp32-cam\recordings"
+RECORDING_FPS = 15.0
+RECORDING_CODEC = "mp4v"
+
+os.makedirs(RECORDING_DIR, exist_ok=True)
+
+# Hang doi rieng, gioi han de khong tich luy RAM; luong camera/display khong cho ghi file.
+# Khi day, bo frame cu thay vi block live view.
+record_queue = queue.Queue(maxsize=30)
+
+# =========================================================
 # FRAME QUEUE
 # =========================================================
 
@@ -142,11 +160,91 @@ frame_queue = queue.Queue(maxsize=1)
 running = True
 
 
+def recording_thread():
+    """Ghi frame co nguoi va ghi tiep toi da 3 giay canh trong sau lan cuoi.
+
+    Moi hang doi gom (frame goc, timestamp monotonic, YOLO co phat hien nguoi).
+    Frame trong chi duoc ghi neu clip da mo; no khong the tu mo mot clip moi.
+    """
+    writer = None
+    current_path = None
+    last_detection_time = None
+
+    def close_writer():
+        nonlocal writer, current_path, last_detection_time
+        if writer is not None:
+            writer.release()
+            print("[REC] Da luu video:", current_path, flush=True)
+        writer = None
+        current_path = None
+        last_detection_time = None
+
+    def open_writer(frame):
+        nonlocal writer, current_path
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        current_path = os.path.join(RECORDING_DIR, f"person_{stamp}.mp4")
+        height, width = frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*RECORDING_CODEC)
+        writer = cv2.VideoWriter(
+            current_path, fourcc, RECORDING_FPS, (width, height)
+        )
+        if not writer.isOpened():
+            print("[REC] Khong mo duoc file video:", current_path, flush=True)
+            writer.release()
+            writer = None
+            current_path = None
+            return False
+        print("[REC] Bat dau ghi:", current_path, flush=True)
+        return True
+
+    while running or not record_queue.empty():
+        try:
+            frame, captured_at, person_detected = record_queue.get(timeout=0.1)
+        except queue.Empty:
+            # Khi het cua so 3 giay tinh tu frame co nguoi cuoi cung, dong file.
+            if (writer is not None and last_detection_time is not None
+                    and time.monotonic() - last_detection_time >= RECORDING_STOP_DELAY):
+                close_writer()
+            continue
+
+        try:
+            # Neu nguoi quay lai sau >= 3 giay vang, dong clip cu truoc.
+            # Frame co nguoi se mo clip moi; frame trong sau han bi bo qua.
+            if (writer is not None and last_detection_time is not None
+                    and captured_at - last_detection_time >= RECORDING_STOP_DELAY):
+                close_writer()
+
+            # Khong mo file neu frame nay khong co nguoi va chua co clip.
+            if writer is None:
+                if not person_detected:
+                    continue
+                if not open_writer(frame):
+                    continue
+
+            # Moc thoi gian chi duoc lam moi khi YOLO dang bao co nguoi.
+            if person_detected:
+                last_detection_time = captured_at
+            elif (last_detection_time is None
+                  or captured_at - last_detection_time >= RECORDING_STOP_DELAY):
+                close_writer()
+                continue
+
+            # Ghi frame camera goc, khong co box/chu/crosshair.
+            writer.write(frame)
+        except Exception as exc:
+            print("[REC] Loi ghi video:", exc, flush=True)
+            close_writer()
+        finally:
+            record_queue.task_done()
+
+    close_writer()
+
+
 # =========================================================
 # CONNECT ESP32 DEVKIT
 # =========================================================
 
-print("Connecting ESP32 DevKit...")
+print("Connecting ESP32 DevKit...", flush=True)
 
 try:
 
@@ -183,7 +281,7 @@ print("ESP32 DevKit connected.")
 # LOAD YOLO
 # =========================================================
 
-print("Loading YOLO...")
+print("Loading YOLO...", flush=True)
 
 try:
 
@@ -199,7 +297,7 @@ except Exception as e:
     raise SystemExit
 
 
-print("YOLO loaded.")
+print("YOLO loaded.", flush=True)
 
 
 # =========================================================
@@ -352,6 +450,12 @@ camera_thread_obj = threading.Thread(
 
 camera_thread_obj.start()
 
+recording_thread_obj = threading.Thread(
+    target=recording_thread,
+    daemon=True
+)
+recording_thread_obj.start()
+
 
 # =========================================================
 # SERVO VARIABLES
@@ -378,6 +482,10 @@ last_yolo_time = 0
 # Khởi tạo bằng thời gian hiện tại
 # để tránh camera tự HOME ngay lúc khởi động
 last_detection_time = time.time()
+# Trang thai ket qua YOLO gan nhat va moc thoi gian frame co nguoi gan nhat.
+person_detected_now = False
+last_person_detected_mono = None
+last_recording_frame_time = 0.0
 
 
 last_person = None
@@ -582,6 +690,9 @@ print("========================================")
 print(f"Camera: {ESP32_CAM_IP}")
 print(f"Serial: {SERIAL_PORT}")
 print(f"YOLO interval: {YOLO_INTERVAL}s")
+print(f"YOLO confidence: {CONFIDENCE}")
+print(f"Recording folder: {RECORDING_DIR}")
+print(f"Recording: person detected + {RECORDING_STOP_DELAY}s final empty scene.")
 print("Return HOME: 10 seconds")
 print("HOME PAN : 90")
 print("HOME TILT: 90")
@@ -614,47 +725,76 @@ while running:
     # YOLO
     # =====================================================
 
-    
-    # =====================================================
-    # YOLO
-    # =====================================================
+    if (
+        current_time - last_yolo_time
+        >= YOLO_INTERVAL
+    ):
 
-    if current_time - last_yolo_time >= YOLO_INTERVAL:
         last_yolo_time = current_time
 
+
+        # -------------------------------------------------
         # YOLO DETECTION
+        # -------------------------------------------------
+
         results = model.predict(
             source=frame,
             imgsz=YOLO_IMGSZ,
-            conf=CONFIDENCE,
-            iou=YOLO_IOU,
+            verbose=False,
             classes=[PERSON_CLASS],
-            verbose=False
+            conf=CONFIDENCE
         )
+
 
         persons = []
 
+
+        # -------------------------------------------------
         # READ DETECTIONS
+        # -------------------------------------------------
+
         for result in results:
+
             if result.boxes is None:
+
                 continue
 
+
             for box in result.boxes:
+
                 x1, y1, x2, y2 = map(
-                    int, box.xyxy[0].tolist()
+                    int,
+                    box.xyxy[0]
                 )
 
-                confidence = float(box.conf[0])
+
+                confidence = float(
+                    box.conf[0]
+                )
+
 
                 width = x2 - x1
                 height = y2 - y1
+
+
                 area = width * height
 
-                persons.append((
-                    area, x1, y1, x2, y2, confidence
-                ))
+
+                persons.append(
+                    (
+                        area,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        confidence
+                    )
+                )
 
 
+        # Trang thai phat hien chi cap nhat moi moi lan YOLO chay.
+        # Khi YOLO khong tim thay nguoi, khong gui frame vang nguoi vao recorder.
+        person_detected_now = bool(persons)
 
         # =================================================
         # PERSON FOUND
@@ -857,6 +997,45 @@ while running:
 
 
     # =====================================================
+    # RECORD: DETECTED PERSON + 3 SECONDS OF EMPTY SCENE
+    # =====================================================
+
+    # Lay mau toi da 15 FPS. Khi YOLO thay nguoi, cap nhat moc thoi gian.
+    # Khi YOLO khong thay nguoi, van gui frame trong toi da 3 giay de ghi vao
+    # phan cuoi clip. Het 3 giay thi ngung gui frame; recorder dong file MP4.
+    captured_at = time.monotonic()
+    if person_detected_now:
+        last_person_detected_mono = captured_at
+
+    within_recording_window = (
+        person_detected_now
+        or (
+            last_person_detected_mono is not None
+            and captured_at - last_person_detected_mono < RECORDING_STOP_DELAY
+        )
+    )
+
+    if within_recording_window and (
+        captured_at - last_recording_frame_time >= 1.0 / RECORDING_FPS
+    ):
+        record_item = (frame.copy(), captured_at, bool(person_detected_now))
+
+        if record_queue.full():
+            try:
+                record_queue.get_nowait()
+                record_queue.task_done()
+            except queue.Empty:
+                pass
+
+        try:
+            record_queue.put_nowait(record_item)
+            last_recording_frame_time = captured_at
+        except queue.Full:
+            # Khong block live view neu recorder khong theo kip.
+            last_recording_frame_time = captured_at
+
+
+    # =====================================================
     # DISPLAY
     # =====================================================
 
@@ -1015,7 +1194,15 @@ while running:
 # CLEANUP
 # =========================================================
 
+# Cho luong ghi xu ly het frame dang cho roi dong file MP4.
 running = False
+try:
+    recording_thread_obj.join(timeout=5.0)
+except Exception:
+    pass
+
+# Cho writer ket thuc dong file MP4 truoc khi thoat.
+recording_thread_obj.join()
 
 
 try:
