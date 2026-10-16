@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32-CAM | Giám sát an ninh</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <p class="eyebrow">ESP32-CAM · YOLO · SQL SERVER</p>
+          <h1>Giám sát an ninh</h1>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <span class="live-dot"></span>
+        <span>Dashboard nội bộ</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="intro-row">
+        <div>
+          <p class="eyebrow">TRUNG TÂM ĐIỀU KHIỂN</p>
+          <h2>Tổng quan hệ thống</h2>
+          <p class="muted">Theo dõi trạng thái kết nối và tra cứu những video đã được ghi khi phát hiện người.</p>
+        </div>
+        <button class="button button-ghost" id="refreshButton" type="button">
+          <span class="refresh-symbol" aria-hidden="true">↻</span> Làm mới dữ liệu
+        </button>
+      </section>
+
+      <section class="stats-grid" aria-label="Trạng thái hệ thống">
+        <article class="stat-card">
+          <div class="stat-head"><span class="stat-icon purple">◉</span><span class="stat-label">Cơ sở dữ liệu</span></div>
+          <div id="dbStatus" class="stat-value">Đang kiểm tra...</div>
+          <div id="dbDetail" class="stat-foot">SQL Server</div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-head"><span class="stat-icon blue">▣</span><span class="stat-label">Tổng sự kiện</span></div>
+          <div id="eventCount" class="stat-value">—</div>
+          <div class="stat-foot">Bản ghi trong SQL Server</div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-head"><span class="stat-icon green">▶</span><span class="stat-label">Video có sẵn</span></div>
+          <div id="videoCount" class="stat-value">—</div>
+          <div class="stat-foot">File MP4 còn trong thư mục recordings</div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-head"><span class="stat-icon orange">⌁</span><span class="stat-label">Camera</span></div>
+          <div id="cameraStatus" class="stat-value">Chưa mở luồng</div>
+          <div class="stat-foot">Luồng trực tiếp bật theo yêu cầu</div>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel camera-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">LIVE VIEW</p>
+              <h3>Camera trực tiếp</h3>
+            </div>
+            <span id="cameraBadge" class="badge badge-neutral">Đang tắt</span>
+          </div>
+          <div class="camera-stage" id="cameraStage">
+            <div class="camera-placeholder" id="cameraPlaceholder">
+              <div class="camera-glyph">◎</div>
+              <strong>Luồng trực tiếp đang tắt</strong>
+              <p>Bật khi cần xem trực tiếp để không tạo thêm kết nối camera ngoài ý muốn.</p>
+            </div>
+            <img id="cameraFeed" alt="Luồng trực tiếp từ ESP32-CAM" hidden>
+            <div id="cameraError" class="camera-error" hidden>Không tải được luồng camera. Kiểm tra IP và kết nối mạng.</div>
+          </div>
+          <div class="camera-controls">
+            <button class="button button-primary" id="toggleCameraButton" type="button">Mở luồng trực tiếp</button>
+            <a class="text-link" href="{{ url_for('camera_proxy') }}" target="_blank" rel="noopener">Mở luồng chia sẻ ở tab mới ↗</a>
+          </div>
+          <p class="hint">Dashboard nhận frame từ relay localhost do tracking.py cung cấp. Chỉ tracking.py kết nối tới ESP32-CAM, nên bạn có thể xem web cùng lúc với YOLO, servo và ghi video.</p>
+        </article>
+
+        <article class="panel details-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">CONFIGURATION</p>
+              <h3>Cấu hình đang sử dụng</h3>
+            </div>
+            <span class="badge badge-neutral">Read-only</span>
+          </div>
+          <dl class="config-list">
+            <div><dt>SQL Server</dt><dd>{{ server_name }}</dd></div>
+            <div><dt>Database</dt><dd>{{ database_name }}</dd></div>
+            <div><dt>Thư mục video</dt><dd class="path-text">D:\esp32-cam\recordings</dd></div>
+            <div><dt>Nguồn camera</dt><dd class="path-text">{{ camera_stream_url }}</dd></div>
+            <div><dt>Luồng chia sẻ từ tracking.py</dt><dd class="path-text">http://127.0.0.1:8765/stream</dd></div>
+          </dl>
+          <div class="info-callout">
+            <span class="info-icon">i</span>
+            <p>Dashboard chỉ đọc lịch sử và phát lại video. Việc nhận diện YOLO, xoay servo và ghi video vẫn do <code>tracking.py</code> đảm nhiệm.</p>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel history-panel">
+        <div class="panel-header history-header">
+          <div>
+            <p class="eyebrow">EVENT LOG</p>
+            <h3>Lịch sử phát hiện người</h3>
+            <p class="muted small">Dữ liệu lấy trực tiếp từ <code>dbo.person_events</code>.</p>
+          </div>
+          <label class="search-box">
+            <span aria-hidden="true">⌕</span>
+            <input type="search" id="searchInput" placeholder="Tìm tên video..." autocomplete="off">
+          </label>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Mã</th>
+                <th>Bắt đầu</th>
+                <th>Lần cuối thấy người</th>
+                <th>Thời lượng</th>
+                <th>Frame có người</th>
+                <th>Video</th>
+              </tr>
+            </thead>
+            <tbody id="eventsBody">
+              <tr><td colspan="6" class="table-message">Đang tải lịch sử...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-footer">
+          <span id="tableSummary">Đang tải...</span>
+          <button class="button button-ghost button-small" id="loadMoreButton" type="button">Tải lại lịch sử</button>
+        </div>
+      </section>
+
+      <section class="panel player-panel" id="playerPanel" hidden>
+        <div class="panel-header">
+          <div>
+            <p class="eyebrow">PLAYBACK</p>
+            <h3 id="playerTitle">Phát lại video</h3>
+          </div>
+          <button class="icon-button" id="closePlayerButton" type="button" aria-label="Đóng trình phát">×</button>
+        </div>
+        <video id="videoPlayer" controls preload="metadata"></video>
+        <p class="hint" id="playbackHint">Lần phát đầu tiên có thể cần chuyển đổi video sang định dạng H.264 tương thích trình duyệt.</p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>ESP32-CAM Person Detection System</span>
+      <span id="lastRefresh">Chưa đồng bộ</span>
+    </footer>
+  </div>
+
+  <script>
+    window.DASHBOARD_CONFIG = {
+      cameraStreamUrl: {{ camera_stream_url|tojson }},
+      cameraProxyUrl: {{ url_for('camera_proxy')|tojson }},
+      refreshIntervalMs: 10000
+    };
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
